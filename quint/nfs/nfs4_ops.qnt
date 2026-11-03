@@ -2620,10 +2620,13 @@ module nfs4ops {
 
 
     pure def opRead(a: Acc, ar: { sel: SidSel, off: int, len: int }): Acc = {
+        // nores carries the OK path's stAccept: every error arm names its
+        // own, or an OK reply where a refusal is predicted replays green
+        // (both replayers tolerate any status in stAccept).
         val nores = { st: OK, count: 0, eof: false, blocks: [],
                       stAccept: Set(OK) }
         val g = fhGate(a)
-        if (g != OK) emit(a, SRead(nores.with("st", g)))
+        if (g != OK) emit(a, SRead(nores.with("st", g).with("stAccept", Set(g))))
         else {
             val tg = dataTypeGate(a)
             if (tg != OK)
@@ -2633,12 +2636,12 @@ module nfs4ops {
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
-                    | IoError(e) => emit(a, SRead(nores.with("st", e)))
+                    | IoError(e) => emit(a, SRead(nores.with("st", e).with("stAccept", Set(e))))
                     | IoAnon =>
                         // Anonymous I/O against an existing deny-read open
                         // fails NFS4ERR_LOCKED (RFC 7530 9.1.4.3).
                         if (anyDeny(a.sdb, a.cfh, 1))
-                            emit(a, SRead(nores.with("st", E_LOCKED)))
+                            emit(a, SRead(nores.with("st", E_LOCKED).with("stAccept", Set(E_LOCKED))))
                         else {
                             val r = fsReadData(cfhNode(a), ar.off, ar.len)
                             emit(a, SRead({ st: OK, count: r.count,
@@ -2653,7 +2656,7 @@ module nfs4ops {
                         // enforcement applies to every accessor, so the
                         // bypass stateid behaves like the anonymous one.
                         if (anyDeny(a.sdb, a.cfh, 1))
-                            emit(a, SRead(nores.with("st", E_LOCKED)))
+                            emit(a, SRead(nores.with("st", E_LOCKED).with("stAccept", Set(E_LOCKED))))
                         else {
                             val r = fsReadData(cfhNode(a), ar.off, ar.len)
                             emit(a, SRead({ st: OK, count: r.count,
@@ -2668,7 +2671,7 @@ module nfs4ops {
                         // reference server that takes the MAY is forgiven
                         // by its registry (KN-11, GD-15).
                         if (not(bitsOverlap(ioMode(a, io), 1)))
-                            emit(a, SRead(nores.with("st", E_OPENMODE)))
+                            emit(a, SRead(nores.with("st", E_OPENMODE).with("stAccept", Set(E_OPENMODE))))
                         else {
                             val r = fsReadData(cfhNode(a), ar.off, ar.len)
                             emit(a, SRead({ st: OK, count: r.count,
@@ -2682,10 +2685,11 @@ module nfs4ops {
 
     pure def opWrite(a: Acc, ar: { sel: SidSel, off: int, len: int,
                                    pat: int, stable: int }): Acc = {
+        // As in opRead: error arms name their own stAccept.
         val nores = { st: OK, count: 0, newSizeBlocks: 0,
                       stAccept: Set(OK) }
         val g = fhGate(a)
-        if (g != OK) emit(a, SWrite(nores.with("st", g)))
+        if (g != OK) emit(a, SWrite(nores.with("st", g).with("stAccept", Set(g))))
         else {
             val tg = dataTypeGate(a)
             if (tg != OK)
@@ -2695,10 +2699,10 @@ module nfs4ops {
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
-                    | IoError(e) => emit(a, SWrite(nores.with("st", e)))
+                    | IoError(e) => emit(a, SWrite(nores.with("st", e).with("stAccept", Set(e))))
                     | IoAnon =>
                         if (anyDeny(a.sdb, a.cfh, 2))
-                            emit(a, SWrite(nores.with("st", E_LOCKED)))
+                            emit(a, SWrite(nores.with("st", E_LOCKED).with("stAccept", Set(E_LOCKED))))
                         else {
                             val w = fsWrite(a.fs, a.cfh, ar.off, ar.len, ar.pat)
                             emit(a.with("fs", w.fs2),
@@ -2710,7 +2714,7 @@ module nfs4ops {
                         // All-ones stateid in WRITE is treated as
                         // anonymous (RFC 8881 8.2.3).
                         if (anyDeny(a.sdb, a.cfh, 2))
-                            emit(a, SWrite(nores.with("st", E_LOCKED)))
+                            emit(a, SWrite(nores.with("st", E_LOCKED).with("stAccept", Set(E_LOCKED))))
                         else {
                             val w = fsWrite(a.fs, a.cfh, ar.off, ar.len, ar.pat)
                             emit(a.with("fs", w.fs2),
@@ -2722,7 +2726,7 @@ module nfs4ops {
                         // WRITE through a stateid lacking WRITE access is
                         // NFS4ERR_OPENMODE (MUST, RFC 8881 9.1.2).
                         if (not(bitsOverlap(ioMode(a, io), 2)))
-                            emit(a, SWrite(nores.with("st", E_OPENMODE)))
+                            emit(a, SWrite(nores.with("st", E_OPENMODE).with("stAccept", Set(E_OPENMODE))))
                         else {
                             val w = fsWrite(a.fs, a.cfh, ar.off, ar.len, ar.pat)
                             emit(a.with("fs", w.fs2),
