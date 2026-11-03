@@ -793,6 +793,52 @@ module nfs4Test42 {
                          RSetattr({ mode: -1, sizeBlocks: 1,
                                     sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }) }) ]))
             .expect(lastStatus == E_BAD_STATEID)
+            // The holder sends the same stateid for everything else it does
+            // to the file: an attribute-only SETATTR (nfs4_do_setattr copies
+            // the delegation stateid for every SETATTR under a write
+            // delegation; the stateid is not consulted and either kind is
+            // OK), READ_PLUS, WRITE_SAME, ALLOCATE and DEALLOCATE -- the
+            // writes refused through a read delegation, as WRITE is.
+            .then(runC([ seq0(9), RPutfh(1),
+                         RSetattr({ mode: 384, sizeBlocks: -1,
+                                    sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK and fsGet(fs, 1).mode == 384)
+            .then(runC([ seq0(10), RPutfh(2),
+                         RSetattr({ mode: 448, sizeBlocks: -1,
+                                    sel: SelRef({ sid: 3, kind: KDeleg, argSeq: 0 }) }) ]))
+            .expect(lastStatus == OK and fsGet(fs, 2).mode == 448)
+            .then(runC([ seq0(11), RPutfh(2),
+                         RAllocate({ sel: SelRef({ sid: 3, kind: KDeleg, argSeq: 0 }),
+                                     off: 0, len: 1 }) ]))
+            .expect(lastStatus == E_OPENMODE)
+            .then(runC([ seq0(12), RPutfh(2),
+                         RDeallocate({ sel: SelRef({ sid: 3, kind: KDeleg, argSeq: 0 }),
+                                       off: 0, len: 1 }) ]))
+            .expect(lastStatus == E_OPENMODE)
+            .then(runC([ seq0(13), RPutfh(2),
+                         RWriteSame({ sel: SelRef({ sid: 3, kind: KDeleg, argSeq: 0 }),
+                                      off: 0, blocks: 1, pat: 2, blocknum: false }) ]))
+            .expect(lastStatus == E_OPENMODE)
+            .then(runC([ seq0(14), RPutfh(2),
+                         RReadPlus({ sel: SelRef({ sid: 3, kind: KDeleg, argSeq: 0 }),
+                                     off: 0, len: 1 }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(15), RPutfh(1),
+                         RWriteSame({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
+                                      off: 0, blocks: 1, pat: 3, blocknum: false }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(16), RPutfh(1),
+                         RAllocate({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
+                                     off: 1, len: 1 }) ]))
+            .expect(lastStatus == OK and fsGet(fs, 1).sizeBlocks == 2)
+            .then(runC([ seq0(17), RPutfh(1),
+                         RDeallocate({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
+                                       off: 0, len: 1 }) ]))
+            .expect(lastStatus == OK)
+            .then(runC([ seq0(18), RPutfh(1),
+                         RReadPlus({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
+                                     off: 0, len: 2 }) ]))
+            .expect(lastStatus == OK)
 
     // --- pNFS ---------------------------------------------------------
 

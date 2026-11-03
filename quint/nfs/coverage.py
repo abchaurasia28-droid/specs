@@ -496,7 +496,17 @@ def classify_compound4(lab, names, buckets, lock_bytes):
     # The delegation stateid gets the same treatment: it is what a Linux
     # client sends under a delegation with no POSIX lock, and a server that
     # refuses it in SETATTR(size) livelocks the client the same way.
-    IO_VIA = {"RRead": "read", "RWrite": "write", "RSetattr": "setattr-size"}
+    # The same client sends it for an attribute-only SETATTR and, at 4.2,
+    # for READ_PLUS, WRITE_SAME, ALLOCATE and DEALLOCATE; those get their
+    # own names.  The -openmode twins pin the refusal path -- a write
+    # through a read delegation, or through a lock on a read-only open,
+    # must be NFS4ERR_OPENMODE -- so a corpus whose every such op happened
+    # to go through a write delegation cannot count, and neither can a
+    # server that answers OK there (the model's error arms carry their own
+    # stAccept, so the replay no longer tolerates it).
+    IO_VIA = {"RRead": "read", "RWrite": "write", "RSetattr": "setattr-size",
+              "RReadPlus": "read-plus", "RWriteSame": "write-same",
+              "RAllocate": "allocate", "RDeallocate": "deallocate"}
     VIA_KIND = {"KLock": "lock", "KDeleg": "deleg"}
     for i, o in enumerate(lab["ops"]):
         name = IO_VIA.get(o.get("tag"))
@@ -504,7 +514,9 @@ def classify_compound4(lab, names, buckets, lock_bytes):
         if name is None or not isinstance(v, dict):
             continue
         if name == "setattr-size" and v.get("sizeBlocks", -1) < 0:
-            continue
+            if v.get("mode", -1) < 0:
+                continue
+            name = "setattr-mode"
         sel = v.get("sel")
         if not (isinstance(sel, dict) and sel.get("tag") == "SelRef"):
             continue
@@ -514,8 +526,11 @@ def classify_compound4(lab, names, buckets, lock_bytes):
         buckets.add(f"v4:x:{name}-via-{via}-stateid")
         if i < len(lab["results"]):
             r = lab["results"][i]["value"]
-            if isinstance(r, dict) and r.get("st", 0) == 0:
+            st = r.get("st", 0) if isinstance(r, dict) else 0
+            if st == 0:
                 buckets.add(f"v4:x:{name}-via-{via}-stateid-ok")
+            elif nm(st) == "OPENMODE":
+                buckets.add(f"v4:x:{name}-via-{via}-stateid-openmode")
 
     # Exclusive creates, per createmode.  A successful one keeps its verifier
     # in time_access/time_modify and must name them in the reply's attrset;
