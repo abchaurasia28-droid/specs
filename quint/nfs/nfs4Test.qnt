@@ -839,6 +839,43 @@ module nfs4Test42 {
                          RReadPlus({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
                                      off: 0, len: 2 }) ]))
             .expect(lastStatus == OK)
+            // COPY carries a delegation stateid for the endpoint the client
+            // holds a delegation on (copy_file_range).  The source is judged
+            // as READ against the saved filehandle, the destination as WRITE
+            // against the current one: either delegation type sources a copy,
+            // a write delegation is a valid destination, a read delegation is
+            // NFS4ERR_OPENMODE, and a delegation of another file is
+            // NFS4ERR_BAD_STATEID.  File 1 holds data (sizeBlocks 2); file 2
+            // is empty until the first copy writes to it.
+            // Source through the write delegation (sid 1, file 1, read-valid)
+            // against the saved filehandle; destination file 2 anonymous.  A
+            // block lands in file 2.
+            .then(runC([ seq0(19), RPutfh(1), RSavefh, RPutfh(2),
+                         RCopy({ srcSel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
+                                 dstSel: SelAnon,
+                                 srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+            .expect(lastStatus == OK and fsGet(fs, 2).sizeBlocks == 1)
+            // Destination through the write delegation (sid 1, file 1); source
+            // file 2 (now 1 block) anonymous.  A block lands in file 1.
+            .then(runC([ seq0(20), RPutfh(2), RSavefh, RPutfh(1),
+                         RCopy({ srcSel: SelAnon,
+                                 dstSel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
+                                 srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+            .expect(lastStatus == OK)
+            // Destination through the read delegation (sid 3, file 2):
+            // NFS4ERR_OPENMODE, and file 2 is left unchanged (still 1 block).
+            .then(runC([ seq0(21), RPutfh(1), RSavefh, RPutfh(2),
+                         RCopy({ srcSel: SelAnon,
+                                 dstSel: SelRef({ sid: 3, kind: KDeleg, argSeq: 0 }),
+                                 srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+            .expect(lastStatus == E_OPENMODE and fsGet(fs, 2).sizeBlocks == 1)
+            // Destination stateid is the delegation of file 1, but the current
+            // filehandle is file 2: NFS4ERR_BAD_STATEID.
+            .then(runC([ seq0(22), RPutfh(1), RSavefh, RPutfh(2),
+                         RCopy({ srcSel: SelAnon,
+                                 dstSel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
+                                 srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+            .expect(lastStatus == E_BAD_STATEID)
 
     // --- pNFS ---------------------------------------------------------
 

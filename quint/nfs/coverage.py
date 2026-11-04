@@ -452,8 +452,35 @@ def load_trace4(path):
     return states
 
 
-def classify_compound4(lab, names, buckets, lock_bytes):
+def update_deleg_types(lab, deleg_types):
+    """Record each granted delegation's sid -> type, so a later op through
+    that delegation stateid can be bucketed by whether it is a read or a
+    write delegation.  A chmod through either kind succeeds (the stateid is
+    not consulted for a mode change), so the -ok twin alone cannot tell them
+    apart; this map lets the setattr-mode bucket split them."""
+    for r in lab.get("results", []):
+        if r.get("tag") != "SOpen":
+            continue
+        v = r.get("value")
+        if not isinstance(v, dict):
+            continue
+        dl = v.get("deleg")
+        if not isinstance(dl, dict):
+            continue
+        dv = dl.get("value")
+        if not isinstance(dv, dict) or "sid" not in dv:
+            continue
+        if dl.get("tag") == "DWrite":
+            deleg_types[dv["sid"]] = "writedeleg"
+        elif dl.get("tag") == "DRead":
+            deleg_types[dv["sid"]] = "readdeleg"
+
+
+def classify_compound4(lab, names, buckets, lock_bytes, deleg_types=None):
     """One COMPOUND -> buckets: compound status, and per-op result status."""
+    if deleg_types is None:
+        deleg_types = {}
+
     def nm(code):
         return names.get(code, f"code{code}")
 
@@ -524,13 +551,65 @@ def classify_compound4(lab, names, buckets, lock_bytes):
         if via is None:
             continue
         buckets.add(f"v4:x:{name}-via-{via}-stateid")
-        if i < len(lab["results"]):
-            r = lab["results"][i]["value"]
-            st = r.get("st", 0) if isinstance(r, dict) else 0
+        # A chmod through a delegation stateid succeeds whether the delegation
+        # is read or write (the stateid is not consulted for a mode change),
+        # so both land in -ok and the twin cannot tell them apart.  Split the
+        # bucket by the delegation's type -- a corpus whose every chmod went
+        # through a read delegation then fails to produce the -writedeleg
+        # bucket, which is the shape Linux actually sends.
+        if name == "setattr-mode" and via == "deleg":
+            dt = deleg_types.get(sel["value"].get("sid"))
+            if dt is not None:
+                buckets.add(f"v4:x:setattr-mode-via-deleg-stateid-{dt}")
+        if i < len(lab["results"]) and isinstance(lab["results"][i]["value"], dict):
+            st = lab["results"][i]["value"].get("st", 0)
             if st == 0:
                 buckets.add(f"v4:x:{name}-via-{via}-stateid-ok")
-            elif nm(st) == "OPENMODE":
+            # The -openmode twin is ratcheted only for the delegation flavour,
+            # which is this ticket's target and whose draw is steered to hit
+            # both delegation types (see delegIo).  The via-lock -openmode
+            # twins are deliberately NOT emitted: a read through a write-only
+            # open or lock is an RFC 8881 9.1.2 MAY the model does not assert,
+            # and the write/size OPENMODE through a lock are generated too
+            # sparsely (a few hits, lockIo does not steer the open mode) to
+            # gate on without flaking.  Not emitting them -- rather than
+            # emitting and omitting them from the baseline -- is what makes a
+            # later --write-expect respect the exclusion instead of silently
+            # ratcheting a fragile bucket.
+            elif nm(st) == "OPENMODE" and via == "deleg":
                 buckets.add(f"v4:x:{name}-via-{via}-stateid-openmode")
+
+    # COPY carries two stateids -- a source judged for READ against the saved
+    # filehandle and a destination judged for WRITE against the current one --
+    # so it is counted apart from the single-filehandle ops above.  A Linux
+    # copy_file_range sends the delegation stateid for the endpoint it holds a
+    # delegation on, and a server that refused it (NFS4ERR_BAD_STATEID while
+    # TEST_STATEID reports it valid) livelocked the client.  Name each endpoint
+    # that rides a lock or delegation stateid; the -ok twin pins the success
+    # path and the -openmode twin the write-through-read-delegation refusal, so
+    # a corpus whose every delegation COPY happened to go through a write
+    # delegation, or a server answering OK on the refusal path, cannot count.
+    for i, o in enumerate(lab["ops"]):
+        if o.get("tag") != "RCopy":
+            continue
+        v = o.get("value")
+        if not isinstance(v, dict):
+            continue
+        rv = (lab["results"][i]["value"]
+              if i < len(lab["results"]) else None)
+        st = rv.get("st", 0) if isinstance(rv, dict) else None
+        for end, selkey in (("src", "srcSel"), ("dst", "dstSel")):
+            sel = v.get(selkey)
+            if not (isinstance(sel, dict) and sel.get("tag") == "SelRef"):
+                continue
+            via = VIA_KIND.get(sel["value"]["kind"]["tag"])
+            if via is None:
+                continue
+            buckets.add(f"v4:x:copy-{end}-via-{via}-stateid")
+            if st == 0:
+                buckets.add(f"v4:x:copy-{end}-via-{via}-stateid-ok")
+            elif st is not None and nm(st) == "OPENMODE":
+                buckets.add(f"v4:x:copy-{end}-via-{via}-stateid-openmode")
 
     # Exclusive creates, per createmode.  A successful one keeps its verifier
     # in time_access/time_modify and must name them in the reply's attrset;
@@ -559,13 +638,19 @@ def analyze4(trace_files, model_dir):
     total = {}
     steps = 0
     for path in trace_files:
+        # Delegation types are learned as the trace runs: a grant in one
+        # compound is used through its stateid in a later one, so the map is
+        # per-trace and updated in order before each compound is classified.
+        deleg_types = {}
         for st in load_trace4(path):
             lab = st["lastOp"]
             if lab.get("tag") != "LCompound":
                 continue
             steps += 1
+            update_deleg_types(lab["value"], deleg_types)
             here = set()
-            classify_compound4(lab["value"], names, here, lock_bytes)
+            classify_compound4(lab["value"], names, here, lock_bytes,
+                               deleg_types)
             for b in here:
                 total[b] = total.get(b, 0) + 1
     return total, steps

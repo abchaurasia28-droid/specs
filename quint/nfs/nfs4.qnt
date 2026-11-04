@@ -1694,22 +1694,48 @@ module nfs4 {
     // ioSetattrSize reach the delegation arm of ioVias only when the file
     // they picked is delegated, the sparse generators never send a
     // delegation stateid, and the delegation flavour runs none of those
-    // actions, so this is what generates the shape there.  Unlike lockIo
-    // nothing is diverted: a read delegation grants READ and READ_PLUS and
-    // answers NFS4ERR_OPENMODE to every write, a MUST either way, and no
-    // other client can hold a write delegation on a file the sender holds
-    // a delegation on.  A server that refuses the stateid with
-    // NFS4ERR_BAD_STATEID while TEST_STATEID reports it valid livelocks the
-    // client, and one that recalls the holder's own delegation for its own
-    // I/O revokes it at the recall deadline; the replay sees both.
+    // actions, so this is what generates the shape there.  A read delegation
+    // grants READ and READ_PLUS and answers NFS4ERR_OPENMODE to every write,
+    // a MUST either way, and no other client can hold a write delegation on a
+    // file the sender holds a delegation on.  Only the attribute-only SETATTR
+    // arm is diverted (see the mode arm below): a chmod mutates metadata and
+    // recalls OTHER clients' delegations on the file, a cross-client recall
+    // the model does not track, so it falls back to a GETATTR when another
+    // client holds a delegation on the file.  A server that refuses the
+    // stateid with NFS4ERR_BAD_STATEID while TEST_STATEID reports it valid
+    // livelocks the client, and one that recalls the holder's own delegation
+    // for its own I/O revokes it at the recall deadline; the replay sees both.
     action delegIo = all {
         genReady,
         usableDelegs.size() > 0,
         {
-            nondet s = oneOf(usableDelegs)
-            val d = sdb.delegs.get(s)
             nondet which = oneOf(if (MINOR >= 2) Set(0, 1, 2, 3, 4, 5, 6, 7)
                                  else Set(0, 1, 2, 3))
+            // Two-level draw: pick the op shape, then steer the delegation
+            // type so every shape samples both a write delegation and a read
+            // one when both exist, rather than leaving the mix to whichever
+            // delegations happen to be live.  A write/size/write_same/
+            // allocate/deallocate through a read delegation is NFS4ERR_OPENMODE
+            // (which==1,2,5,6,7), and a chmod (which==3) is OK through either
+            // kind but must be seen through both so coverage can tell them
+            // apart -- without steering, a 2-hit -openmode or a missing
+            // -readdeleg bucket is one generator shift away from the gate.
+            // The read preference is the minority (one draw in three) so the
+            // OK path -- the common case, and the one a write delegation
+            // reaches -- stays the better-populated of the two for the sparse
+            // write ops (deallocate, write_same), while the read path still
+            // gets a reliable share for the -openmode twin.
+            val writeDelegs = usableDelegs.filter(x => sdb.delegs.get(x).isWrite)
+            val readDelegs = usableDelegs.filter(x => not(sdb.delegs.get(x).isWrite))
+            // A Set carries no multiplicity, so weight the coin with an
+            // integer draw: read is preferred on one draw in three.
+            nondet readRoll = oneOf(0.to(2))
+            val preferRead = readRoll == 0
+            val pool = if (preferRead and readDelegs.size() > 0) readDelegs
+                       else if (writeDelegs.size() > 0) writeDelegs
+                       else usableDelegs
+            nondet s = oneOf(pool)
+            val d = sdb.delegs.get(s)
             nondet off = oneOf(0.to(MAX_BLOCKS - 1))
             nondet len = oneOf(1.to(2))
             nondet pat = oneOf(BLOCK_SYMS)
@@ -1753,6 +1779,43 @@ module nfs4 {
                 runC(withSess(d.client, [ RPutfh(d.file), RGetattr ]))
             else
                 runC(withSess(d.client, [ RPutfh(d.file), op ]))
+        },
+    }
+
+    // COPY carries the delegation stateid for the endpoint the client holds a
+    // delegation on (copy_file_range), the same way delegIo covers the
+    // single-filehandle ops.  The destination is the delegated file, judged
+    // for WRITE against the current filehandle -- a write delegation is OK,
+    // a read delegation is NFS4ERR_OPENMODE; the source is another file the
+    // client reads anonymously, so no second stateid is needed.  A source
+    // with data keeps the OK path a real copy rather than a zero-length one.
+    // Diverted to a GETATTR when another client holds a delegation on the
+    // destination (delegOther: a write to it recalls that delegation, the
+    // cross-client recall the model does not track) or a write delegation on
+    // the source, exactly as copyRange and the delegIo mode arm divert.
+    action delegCopy = all {
+        MINOR >= 2,
+        genReady,
+        usableDelegs.size() > 0,
+        {
+            nondet s = oneOf(usableDelegs)
+            val d = sdb.delegs.get(s)
+            val srcFiles = files.filter(f =>
+                f != d.file and fsGet(fs, f).sizeBlocks > 0)
+            all {
+                srcFiles.size() > 0,
+                {
+                    nondet f2 = oneOf(srcFiles)
+                    if (delegOther(d.file, d.client) or
+                        delegOtherWrite(f2, d.client))
+                        runC(withSess(d.client, [ RPutfh(d.file), RGetattr ]))
+                    else
+                        runC(withSess(d.client,
+                            [ RPutfh(f2), RSavefh, RPutfh(d.file),
+                              RCopy({ srcSel: SelAnon, dstSel: delegSel(s),
+                                      srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+                },
+            }
         },
     }
 
@@ -2341,6 +2404,7 @@ module nfs4 {
         delegBreakRemove, delegBreakRemove,
         delegReturn, delegReturn, delegReturn, delegReturn,
         delegIo, delegIo, delegIo,
+        delegCopy, delegCopy,
         closeOpen, closeOpen,
         nsGetattr, nsGetattr,
     }

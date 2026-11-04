@@ -2997,13 +2997,16 @@ emit(a,
 
     pure def opLayoutget(a: Acc, ar: { rw: bool, lo: int, hi: int,
                                        sel: SidSel }): Acc = {
+        // nores carries the OK path's stAccept; every error arm names its
+        // own, or an OK reply where a refusal is predicted replays green
+        // (both replayers tolerate any status in stAccept).
         val nores = { st: OK, sid: -1, seq: 0, lo: 0, hi: 0,
                       stAccept: Set(OK) }
-        if (a.minor < 1) emit(a, SLayoutget(nores.with("st", E_OP_ILLEGAL)))
-        else if (not(a.caps.pnfs)) emit(a, SLayoutget(nores.with("st", E_NOTSUPP)))
+        if (a.minor < 1) emit(a, SLayoutget(nores.with("st", E_OP_ILLEGAL).with("stAccept", Set(E_OP_ILLEGAL))))
+        else if (not(a.caps.pnfs)) emit(a, SLayoutget(nores.with("st", E_NOTSUPP).with("stAccept", Set(E_NOTSUPP))))
         else {
             val g = fhGate(a)
-            if (g != OK) emit(a, SLayoutget(nores.with("st", g)))
+            if (g != OK) emit(a, SLayoutget(nores.with("st", g).with("stAccept", Set(g))))
             else if (cfhNode(a).ftype != FReg)
                 emit(a, SLayoutget(nores.with("st", E_WRONG_TYPE)
                                         .with("stAccept",
@@ -3012,9 +3015,9 @@ emit(a,
             else {
                 val io = resolveSel(a, ar.sel)
                 match io {
-                    | IoError(e) => emit(a, SLayoutget(nores.with("st", e)))
-                    | IoAnon => emit(a, SLayoutget(nores.with("st", E_BAD_STATEID)))
-                    | IoBypass => emit(a, SLayoutget(nores.with("st", E_BAD_STATEID)))
+                    | IoError(e) => emit(a, SLayoutget(nores.with("st", e).with("stAccept", Set(e))))
+                    | IoAnon => emit(a, SLayoutget(nores.with("st", E_BAD_STATEID).with("stAccept", Set(E_BAD_STATEID))))
+                    | IoBypass => emit(a, SLayoutget(nores.with("st", E_BAD_STATEID).with("stAccept", Set(E_BAD_STATEID))))
                     | IoState(s) => {
                         val cid = match s.kind {
                             | KOpen => a.sdb.opens.get(s.sid).client
@@ -3178,6 +3181,57 @@ emit(a,
                         else if (r.kind == KOpen and
                                  a.sdb.opens.get(r.sid).needConfirm)
                             E_BAD_STATEID
+                        else OK
+                    }
+                }
+        }
+
+    // COPY judges each endpoint's stateid like the single-FH I/O ops, but
+    // against a different filehandle: the source for READ against the saved
+    // FH, the destination for WRITE against the current one.  Unlike CLONE,
+    // COPY accepts the special stateids (the server derives the access check
+    // from the filehandles, copyTest pins it) -- a special stateid returns OK
+    // here and the deny-reservation (NFS4ERR_LOCKED) check downstream covers
+    // it.  A named stateid of the wrong file or another client is
+    // NFS4ERR_BAD_STATEID, and one that lacks the needed mode (a read-only
+    // open or, for the destination, a read delegation) is NFS4ERR_OPENMODE.
+    pure def copySidGate(a: Acc, sel: SidSel, fh: Ino, needWrite: bool): int =
+        match sel {
+            | SelAnon => OK
+            | SelBypass => OK
+            | SelRef(r) =>
+                match checkSid(a.sdb, r.sid, r.kind, r.argSeq) {
+                    | SidBad => E_BAD_STATEID
+                    | SidOld => E_OLD_STATEID
+                    | SidOk => {
+                        val fOf = match r.kind {
+                            | KOpen => a.sdb.opens.get(r.sid).file
+                            | KLock => a.sdb.locks.get(r.sid).file
+                            | KDeleg => a.sdb.delegs.get(r.sid).file
+                            | KLayout => a.sdb.layouts.get(r.sid).file
+                        }
+                        val ownedBy = match r.kind {
+                            | KOpen => a.sdb.opens.get(r.sid).client
+                            | KLock => a.sdb.locks.get(r.sid).client
+                            | KDeleg => a.sdb.delegs.get(r.sid).client
+                            | KLayout => a.sdb.layouts.get(r.sid).client
+                        }
+                        val mode = match r.kind {
+                            | KOpen => a.sdb.opens.get(r.sid).access
+                            | KLock => a.sdb.opens.get(a.sdb.locks.get(r.sid).openSid).access
+                            | KDeleg => if (a.sdb.delegs.get(r.sid).isWrite) 3 else 1
+                            | KLayout => 0
+                        }
+                        if (fOf != fh) E_BAD_STATEID
+                        else if (a.minor >= 1 and a.seqClient != -1 and
+                                 ownedBy != a.seqClient)
+                            E_BAD_STATEID
+                        else if (r.kind == KOpen and
+                                 a.sdb.opens.get(r.sid).needConfirm)
+                            E_BAD_STATEID
+                        else if (not(bitsOverlap(mode,
+                                                 if (needWrite) 2 else 1)))
+                            E_OPENMODE
                         else OK
                     }
                 }
@@ -3348,16 +3402,29 @@ emit(a,
     // is why copyRange generates concrete open stateids only.
     pure def opCopy(a: Acc, ar: { srcSel: SidSel, dstSel: SidSel,
                                   srcOff: int, dstOff: int, cnt: int }): Acc = {
+        // nores carries the OK path's stAccept; every error arm names its
+        // own, or an OK reply where a refusal is predicted replays green
+        // (both replayers tolerate any status in stAccept).
         val nores = { st: OK, copied: 0, stAccept: Set(OK) }
-        if (a.minor < 2) emit(a, SCopy(nores.with("st", E_OP_ILLEGAL)))
-        else if (not(a.caps.copy)) emit(a, SCopy(nores.with("st", E_NOTSUPP)))
+        if (a.minor < 2) emit(a, SCopy(nores.with("st", E_OP_ILLEGAL).with("stAccept", Set(E_OP_ILLEGAL))))
+        else if (not(a.caps.copy)) emit(a, SCopy(nores.with("st", E_NOTSUPP).with("stAccept", Set(E_NOTSUPP))))
         else if (a.sfh == -1 or a.cfh == -1)
-            emit(a, SCopy(nores.with("st", E_NOFILEHANDLE)))
+            emit(a, SCopy(nores.with("st", E_NOFILEHANDLE).with("stAccept", Set(E_NOFILEHANDLE))))
         else if (not(fsLive(a.fs, a.sfh)) or not(fsLive(a.fs, a.cfh)))
-            emit(a, SCopy(nores.with("st", E_STALE)))
+            emit(a, SCopy(nores.with("st", E_STALE).with("stAccept", Set(E_STALE))))
         else if (a.sfh == a.cfh)
-            emit(a, SCopy(nores.with("st", E_INVAL)))
+            emit(a, SCopy(nores.with("st", E_INVAL).with("stAccept", Set(E_INVAL))))
         else {
+            // The source stateid must be READ-valid against the saved FH, the
+            // destination WRITE-valid against the current one (RFC 7862
+            // 15.2.3).  The server resolves both before issuing the copy, so
+            // a stateid error precedes the file-type and range errors the
+            // copy itself would raise.
+            val sg = copySidGate(a, ar.srcSel, a.sfh, false)
+            val dg = copySidGate(a, ar.dstSel, a.cfh, true)
+            if (sg != OK) emit(a, SCopy(nores.with("st", sg).with("stAccept", Set(sg))))
+            else if (dg != OK) emit(a, SCopy(nores.with("st", dg).with("stAccept", Set(dg))))
+            else {
             val src = fsGet(a.fs, a.sfh)
             val dst = fsGet(a.fs, a.cfh)
             if (src.ftype != FReg or dst.ftype != FReg) {
@@ -3373,7 +3440,7 @@ emit(a,
                           else ar.cnt
                 if (ar.srcOff + cnt > src.sizeBlocks or
                     (ar.cnt == 0 and ar.srcOff > src.sizeBlocks))
-                    emit(a, SCopy(nores.with("st", E_INVAL)))
+                    emit(a, SCopy(nores.with("st", E_INVAL).with("stAccept", Set(E_INVAL))))
                 // COPY reads the source and writes the destination, so the
                 // share reservations that gate READ and WRITE gate it too
                 // (RFC 8881 9.7).  A stateid that names an open carries its
@@ -3383,9 +3450,9 @@ emit(a,
                 // a way around the reservation.  Checked after the range so
                 // an out-of-range COPY still reports the argument error.
                 else if (namesNoOpen(ar.srcSel) and anyDeny(a.sdb, a.sfh, 1))
-                    emit(a, SCopy(nores.with("st", E_LOCKED)))
+                    emit(a, SCopy(nores.with("st", E_LOCKED).with("stAccept", Set(E_LOCKED))))
                 else if (namesNoOpen(ar.dstSel) and anyDeny(a.sdb, a.cfh, 2))
-                    emit(a, SCopy(nores.with("st", E_LOCKED)))
+                    emit(a, SCopy(nores.with("st", E_LOCKED).with("stAccept", Set(E_LOCKED))))
                 else {
                     val data = fsReadData(src, ar.srcOff, cnt)
                     val w = range(0, cnt).foldl(a.fs, (acc, i) =>
@@ -3393,6 +3460,7 @@ emit(a,
                                 data.syms[i]).fs2)
                     emit(a.with("fs", w), SCopy({ st: OK, copied: cnt, stAccept: Set(OK) }))
                 }
+            }
             }
         }
     }

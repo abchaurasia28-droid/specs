@@ -21,6 +21,7 @@ v4:SCommit:ISDIR
 v4:SCommit:OK
 v4:SCopy:INVAL
 v4:SCopy:OK
+v4:SCopy:OPENMODE
 v4:SCreate:BADCHAR
 v4:SCreate:BADNAME
 v4:SCreate:BADTYPE
@@ -231,6 +232,9 @@ v4:compound:tagged
 v4:x:allocate-via-deleg-stateid
 v4:x:allocate-via-deleg-stateid-ok
 v4:x:allocate-via-deleg-stateid-openmode
+v4:x:copy-dst-via-deleg-stateid
+v4:x:copy-dst-via-deleg-stateid-ok
+v4:x:copy-dst-via-deleg-stateid-openmode
 v4:x:deallocate-via-deleg-stateid
 v4:x:deallocate-via-deleg-stateid-ok
 v4:x:deallocate-via-deleg-stateid-openmode
@@ -247,6 +251,8 @@ v4:x:read-via-lock-stateid
 v4:x:read-via-lock-stateid-ok
 v4:x:setattr-mode-via-deleg-stateid
 v4:x:setattr-mode-via-deleg-stateid-ok
+v4:x:setattr-mode-via-deleg-stateid-readdeleg
+v4:x:setattr-mode-via-deleg-stateid-writedeleg
 v4:x:setattr-size-via-deleg-stateid
 v4:x:setattr-size-via-deleg-stateid-ok
 v4:x:setattr-size-via-deleg-stateid-openmode
