@@ -1681,39 +1681,141 @@ module nfs4 {
     }
 
     // I/O through a delegation stateid, sent by the client that holds the
-    // delegation: READ, WRITE or a size-changing SETATTR.  This is what a
-    // Linux client sends while it holds a delegation on the file and no
-    // POSIX lock (nfs4_select_rw_stateid() falls back to the delegation
-    // stateid before the open stateid; truncate(2) with no open context
-    // tries nfs4_copy_delegation_stateid() before the anonymous one).  The
-    // random draw in ioRead / ioWrite / ioSetattrSize reaches the
-    // delegation arm of ioVias only when the file it picked is delegated,
-    // and the delegation flavour runs none of those actions, so this is
-    // what generates the shape there.  Unlike lockIo nothing is diverted:
-    // a read delegation grants READ and answers NFS4ERR_OPENMODE to WRITE
-    // and SETATTR(size), a MUST either way, and no other client can hold a
-    // write delegation on a file the sender holds a delegation on.
+    // delegation: READ, WRITE, a size-changing SETATTR, an attribute-only
+    // SETATTR, and at 4.2 READ_PLUS, WRITE_SAME, ALLOCATE and DEALLOCATE.
+    // This is what a Linux client sends while it holds a delegation on the
+    // file and no POSIX lock (nfs4_select_rw_stateid() falls back to the
+    // delegation stateid before the open stateid; truncate(2) with no open
+    // context tries nfs4_copy_delegation_stateid() before the anonymous
+    // one; nfs4_do_setattr() copies it for every SETATTR under a write
+    // delegation, so a chmod or utimes carries it too; a 4.2 client's
+    // ordinary read is READ_PLUS; fallocate and punch-hole send it in
+    // ALLOCATE and DEALLOCATE).  The random draws in ioRead / ioWrite /
+    // ioSetattrSize reach the delegation arm of ioVias only when the file
+    // they picked is delegated, the sparse generators never send a
+    // delegation stateid, and the delegation flavour runs none of those
+    // actions, so this is what generates the shape there.  A read delegation
+    // grants READ and READ_PLUS and answers NFS4ERR_OPENMODE to every write,
+    // a MUST either way, and no other client can hold a write delegation on a
+    // file the sender holds a delegation on.  Only the attribute-only SETATTR
+    // arm is diverted (see the mode arm below): a chmod mutates metadata and
+    // recalls OTHER clients' delegations on the file, a cross-client recall
+    // the model does not track, so it falls back to a GETATTR when another
+    // client holds a delegation on the file.  A server that refuses the
+    // stateid with NFS4ERR_BAD_STATEID while TEST_STATEID reports it valid
+    // livelocks the client, and one that recalls the holder's own delegation
+    // for its own I/O revokes it at the recall deadline; the replay sees both.
     action delegIo = all {
         genReady,
         usableDelegs.size() > 0,
         {
-            nondet s = oneOf(usableDelegs)
+            nondet which = oneOf(if (MINOR >= 2) Set(0, 1, 2, 3, 4, 5, 6, 7)
+                                 else Set(0, 1, 2, 3))
+            // Two-level draw: pick the op shape, then steer the delegation
+            // type so every shape samples both a write delegation and a read
+            // one when both exist, rather than leaving the mix to whichever
+            // delegations happen to be live.  A write/size/write_same/
+            // allocate/deallocate through a read delegation is NFS4ERR_OPENMODE
+            // (which==1,2,5,6,7), and a chmod (which==3) is OK through either
+            // kind but must be seen through both so coverage can tell them
+            // apart -- without steering, a 2-hit -openmode or a missing
+            // -readdeleg bucket is one generator shift away from the gate.
+            // The read preference is the minority (one draw in three) so the
+            // OK path -- the common case, and the one a write delegation
+            // reaches -- stays the better-populated of the two for the sparse
+            // write ops (deallocate, write_same), while the read path still
+            // gets a reliable share for the -openmode twin.
+            val writeDelegs = usableDelegs.filter(x => sdb.delegs.get(x).isWrite)
+            val readDelegs = usableDelegs.filter(x => not(sdb.delegs.get(x).isWrite))
+            // A Set carries no multiplicity, so weight the coin with an
+            // integer draw: read is preferred on one draw in three.
+            nondet readRoll = oneOf(0.to(2))
+            val preferRead = readRoll == 0
+            val pool = if (preferRead and readDelegs.size() > 0) readDelegs
+                       else if (writeDelegs.size() > 0) writeDelegs
+                       else usableDelegs
+            nondet s = oneOf(pool)
             val d = sdb.delegs.get(s)
-            nondet which = oneOf(Set(0, 1, 2))
             nondet off = oneOf(0.to(MAX_BLOCKS - 1))
             nondet len = oneOf(1.to(2))
             nondet pat = oneOf(BLOCK_SYMS)
             nondet stable = oneOf(STABLE_LEVELS)
             nondet sz = oneOf(0.to(MAX_BLOCKS))
+            nondet m = oneOf(MODES)
             val op = if (which == 0)
                          RRead({ sel: delegSel(s), off: off, len: len })
                      else if (which == 1)
                          RWrite({ sel: delegSel(s), off: off,
                                   len: imin(len, MAX_BLOCKS - off), pat: pat,
                                   stable: stable })
-                     else
+                     else if (which == 2)
                          RSetattr({ mode: -1, sizeBlocks: sz, sel: delegSel(s) })
-            runC(withSess(d.client, [ RPutfh(d.file), op ]))
+                     else if (which == 3)
+                         RSetattr({ mode: m, sizeBlocks: -1, sel: delegSel(s) })
+                     else if (which == 4)
+                         RReadPlus({ sel: delegSel(s), off: off, len: len })
+                     else if (which == 5)
+                         RWriteSame({ sel: delegSel(s), off: off,
+                                      blocks: imin(len, MAX_BLOCKS - off),
+                                      pat: pat, blocknum: false })
+                     else if (which == 6)
+                         RAllocate({ sel: delegSel(s), off: off,
+                                     len: imin(len, MAX_BLOCKS - off) })
+                     else
+                         RDeallocate({ sel: delegSel(s), off: off, len: len })
+            // An attribute-only SETATTR (a chmod) through the holder's own
+            // delegation mutates the file's metadata, which recalls every
+            // OTHER client's delegation on the file -- a cross-client recall
+            // the model does not yet track (the data-path/recall-flush
+            // follow-on deferred by chimera-nas/specs#49).  Divert it to a
+            // GETATTR when another client holds a delegation on the file, as
+            // the sparse generators divert their mutations (delegOther); the
+            // sole-holder case, which is the common one, still generates the
+            // chmod.  Every other arm is safe: a read mutates nothing, a
+            // write/size/allocate/deallocate/write_same through a read
+            // delegation is refused NFS4ERR_OPENMODE before it mutates, and
+            // through a write delegation no other client can hold one.
+            if (which == 3 and delegOther(d.file, d.client))
+                runC(withSess(d.client, [ RPutfh(d.file), RGetattr ]))
+            else
+                runC(withSess(d.client, [ RPutfh(d.file), op ]))
+        },
+    }
+
+    // COPY carries the delegation stateid for the endpoint the client holds a
+    // delegation on (copy_file_range), the same way delegIo covers the
+    // single-filehandle ops.  The destination is the delegated file, judged
+    // for WRITE against the current filehandle -- a write delegation is OK,
+    // a read delegation is NFS4ERR_OPENMODE; the source is another file the
+    // client reads anonymously, so no second stateid is needed.  A source
+    // with data keeps the OK path a real copy rather than a zero-length one.
+    // Diverted to a GETATTR when another client holds a delegation on the
+    // destination (delegOther: a write to it recalls that delegation, the
+    // cross-client recall the model does not track) or a write delegation on
+    // the source, exactly as copyRange and the delegIo mode arm divert.
+    action delegCopy = all {
+        MINOR >= 2,
+        genReady,
+        usableDelegs.size() > 0,
+        {
+            nondet s = oneOf(usableDelegs)
+            val d = sdb.delegs.get(s)
+            val srcFiles = files.filter(f =>
+                f != d.file and fsGet(fs, f).sizeBlocks > 0)
+            all {
+                srcFiles.size() > 0,
+                {
+                    nondet f2 = oneOf(srcFiles)
+                    if (delegOther(d.file, d.client) or
+                        delegOtherWrite(f2, d.client))
+                        runC(withSess(d.client, [ RPutfh(d.file), RGetattr ]))
+                    else
+                        runC(withSess(d.client,
+                            [ RPutfh(f2), RSavefh, RPutfh(d.file),
+                              RCopy({ srcSel: SelAnon, dstSel: delegSel(s),
+                                      srcOff: 0, dstOff: 0, cnt: 1 }) ]))
+                },
+            }
         },
     }
 
@@ -2288,8 +2390,9 @@ module nfs4 {
     // retried OPEN's grant path is reached.
     // Delegation lifecycle: grants, cross-client open/remove breaks
     // (recall + NFS4ERR_DELAY), returns and retried opens, plus the
-    // holder's own I/O through its delegation stateid (delegIo), which is
-    // what a Linux client sends under a delegation.  Data-path coherency of
+    // holder's own I/O through its delegation stateid (delegIo) -- READ,
+    // WRITE, both kinds of SETATTR and the 4.2 sparse ops, which is what a
+    // Linux client sends under a delegation.  Data-path coherency of
     // cached writes and recall flushes against the model's block map is a
     // deeper layer left to a follow-on; nsGetattr is the one read here, and
     // it only observes the change attribute the lifecycle already tracks.
@@ -2300,7 +2403,8 @@ module nfs4 {
         delegBreakOpen, delegBreakOpen, delegBreakOpen,
         delegBreakRemove, delegBreakRemove,
         delegReturn, delegReturn, delegReturn, delegReturn,
-        delegIo, delegIo,
+        delegIo, delegIo, delegIo,
+        delegCopy, delegCopy,
         closeOpen, closeOpen,
         nsGetattr, nsGetattr,
     }
