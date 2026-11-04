@@ -826,7 +826,9 @@ module nfs4Test42 {
             .then(runC([ seq0(15), RPutfh(1),
                          RWriteSame({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
                                       off: 0, blocks: 1, pat: 3, blocknum: false }) ]))
-            .expect(lastStatus == OK)
+            // WRITE_SAME stamped block 0 with pattern 3.
+            .expect(lastStatus == OK and
+                    blockSym(blockAt(fsGet(fs, 1), 0)) == 3)
             .then(runC([ seq0(16), RPutfh(1),
                          RAllocate({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
                                      off: 1, len: 1 }) ]))
@@ -834,7 +836,9 @@ module nfs4Test42 {
             .then(runC([ seq0(17), RPutfh(1),
                          RDeallocate({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
                                        off: 0, len: 1 }) ]))
-            .expect(lastStatus == OK)
+            // DEALLOCATE punched block 0 back to a hole (reads as symbol 0).
+            .expect(lastStatus == OK and
+                    blockSym(blockAt(fsGet(fs, 1), 0)) == 0)
             .then(runC([ seq0(18), RPutfh(1),
                          RReadPlus({ sel: SelRef({ sid: 1, kind: KDeleg, argSeq: 0 }),
                                      off: 0, len: 2 }) ]))
