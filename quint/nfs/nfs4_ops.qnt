@@ -248,8 +248,8 @@ module nfs4ops {
         // change attribute is left to the server by RFC 8276, and chimera's
         // backends answer differently.  See Inode.chgOpaque.
         tolXattrChange: bool,
-        // TOLERANCE (not a deviation): RFC 7530 16.30.4 lists both
-        // NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID for RENEW and 9.6.3
+        // TOLERANCE (not a deviation): RFC 7530 13.2 lists both
+        // NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID for RENEW (16.28) and 9.6.3
         // leaves a lapsed client id's survival to the server.  See opRenew.
         tolRenewLapsed: bool,
         // TOLERANCE (not a deviation): OPEN4_RESULT_CONFIRM is inert above
@@ -419,8 +419,8 @@ module nfs4ops {
         | SNverify({ st: int, stAccept: Set[int] })
         | SSetclientid({ st: int, client: ClientId, tok: int })
         | SSetclientidConfirm({ st: int })
-        // TOLERANCE (T_RENEW_LAPSED).  RFC 7530 16.30.4 lists BOTH
-        // NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID for RENEW, and 9.6.3
+        // TOLERANCE (T_RENEW_LAPSED).  RFC 7530 13.2 lists BOTH
+        // NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID for RENEW (16.28), and 9.6.3
         // leaves it to the server how long a client id whose lease has
         // lapsed survives -- so a late RENEW may be refused as a stale id,
         // refused as an expired lease, or simply succeed and refresh it.
@@ -460,7 +460,7 @@ module nfs4ops {
                   attrsetTimes: bool })
         | SOpenConfirm({ st: int, seq: int })
         | SOpenDowngrade({ st: int, seq: int })
-        | SClose({ st: int })
+        | SClose({ st: int, stAccept: Set[int] })
         | SRead({ st: int, count: int, eof: bool, blocks: List[int],
                   stAccept: Set[int] })
         | SWrite({ st: int, count: int, newSizeBlocks: int,
@@ -1784,7 +1784,7 @@ module nfs4ops {
     pure def opRenew(a: Acc, cid: ClientId): Acc =
         if (a.minor != 0) emit(a, SRenew({ st: E_OP_ILLEGAL, stAccept: Set(E_OP_ILLEGAL) }))
         else if (a.sdb.lostClients.contains(cid))
-            // Lease cancelled and state released: RFC 7530 16.30.4 lists both
+            // Lease cancelled and state released: RFC 7530 13.2 lists both
             // NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID; never NFS4_OK.
             emit(a, SRenew({ st: E_EXPIRED,
                              stAccept: Set(E_EXPIRED, E_STALE_CLIENTID) }))
@@ -2282,9 +2282,12 @@ module nfs4ops {
         val g = fhGate(a)
         // 4.0: the owner-seqid gate runs first and BAD_SEQID does not
         // consume a seqid (RFC 7530 9.1.7/9.1.9).
-        if (a.sdb.lostClients.contains(ar.client))
+        if (a.minor == 0 and a.sdb.lostClients.contains(ar.client))
             // Lease cancelled: the old clientid is expired (RFC 7530 9.6.3.2).
-            emit(a, SOpen(nores.with("st", E_EXPIRED)))
+            // A server that later retires the record answers STALE_CLIENTID
+            // instead; RFC 7530 13.2 lists both for OPEN.
+            emit(a, SOpen(nores.with("st", E_EXPIRED)
+                              .with("stAccept", Set(E_EXPIRED, E_STALE_CLIENTID))))
         else if (a.minor == 0 and
             (not(a.sdb.clients.keys().contains(ar.client)) or
              not(a.sdb.clients.get(ar.client).confirmed)))
@@ -2520,20 +2523,23 @@ module nfs4ops {
 
     pure def opClose(a: Acc, ar: { sid: Sid, argSeq: int, oseq: int }): Acc = {
         val g = fhGate(a)
-        if (g != OK) emit(a, SClose({ st: g }))
+        if (g != OK) emit(a, SClose({ st: g, stAccept: Set(g) }))
         else if (a.sdb.expiredSids.contains(ar.sid))
-            emit(a, SClose({ st: E_EXPIRED }))
+            // State lost to lease expiration: RFC 7530 9.1.4.4 allows
+            // NFS4ERR_EXPIRED or NFS4ERR_BAD_STATEID.
+            emit(a, SClose({ st: E_EXPIRED,
+                             stAccept: Set(E_EXPIRED, E_BAD_STATEID) }))
         else if (not(sidLive(a.sdb, ar.sid, KOpen)))
-            emit(a, SClose({ st: E_BAD_STATEID }))
+            emit(a, SClose({ st: E_BAD_STATEID, stAccept: Set(E_BAD_STATEID) }))
         else {
             val o = a.sdb.opens.get(ar.sid)
             if (a.minor == 0 and not(ooGateOk(a.caps, a.sdb, o.client, o.owner, ar.oseq)))
-                emit(a, SClose({ st: E_BAD_SEQID }))
+                emit(a, SClose({ st: E_BAD_SEQID, stAccept: Set(E_BAD_SEQID) }))
             else if (o.needConfirm)
                 // CLOSE of an unconfirmed open (RFC 7530 16.18.5).
-                emit(a, SClose({ st: E_BAD_STATEID }))
+                emit(a, SClose({ st: E_BAD_STATEID, stAccept: Set(E_BAD_STATEID) }))
             else if (o.file != a.cfh)
-                emit(a, SClose({ st: E_BAD_STATEID }))
+                emit(a, SClose({ st: E_BAD_STATEID, stAccept: Set(E_BAD_STATEID) }))
             else {
                 val chk = checkSid(a.sdb, ar.sid, KOpen, ar.argSeq)
                 val st0 = match chk {
@@ -2542,7 +2548,7 @@ module nfs4ops {
                     | SidBad => E_BAD_STATEID
                 }
                 if (st0 != OK) {
-                    val a1 = emit(a, SClose({ st: st0 }))
+                    val a1 = emit(a, SClose({ st: st0, stAccept: Set(st0) }))
                     if (a.minor == 0)
                         a1.with("sdb", ooSettle(a1.sdb, o.client, o.owner,
                                                 ar.oseq, st0, false))
@@ -2552,7 +2558,7 @@ module nfs4ops {
                     val locked = lockSids.exists(s =>
                         a.sdb.locks.get(s).bytes.keys().size() > 0)
                     if (locked and not(a.caps.closeFreesLocks)) {
-                        val a1 = emit(a, SClose({ st: E_LOCKS_HELD }))
+                        val a1 = emit(a, SClose({ st: E_LOCKS_HELD, stAccept: Set(E_LOCKS_HELD) }))
                         if (a.minor == 0)
                             a1.with("sdb", ooSettle(a1.sdb, o.client, o.owner,
                                                     ar.oseq, E_LOCKS_HELD,
@@ -2568,7 +2574,7 @@ module nfs4ops {
                         // the orphaned inode.
                         emit(a.with("sdb", sdb2)
                               .with("fs", maybeReap(a.fs, sdb2, o.file)),
-                             SClose({ st: OK }))
+                             SClose({ st: OK, stAccept: Set(OK) }))
                     }
                 }
             }

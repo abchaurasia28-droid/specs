@@ -279,7 +279,7 @@ module nfs4fs {
         fs.with("inodes", mapDrop(fs.inodes, i))
           .with("removed", fs.removed.union(Set(i)))
 
-    // RENAME (RFC 7530 16.28 / RFC 8881 18.26): full POSIX matrix.
+    // RENAME (RFC 7530 16.27 / RFC 8881 18.26): full POSIX matrix.
     //  - source must exist (FsNoent)
     //  - self-rename or rename onto another link of the same object: no-op OK
     //  - a directory cannot move into its own subtree (FsInval)

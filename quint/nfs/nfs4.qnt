@@ -103,8 +103,8 @@ module nfs4 {
     // corpus replayed against every backend can say.
     const T_XATTR_CHANGE: bool
 
-    // RFC 7530 16.30.4 lists BOTH NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID
-    // for RENEW, and 9.6.3 leaves it to the server how long a client id whose
+    // RFC 7530 13.2 lists BOTH NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID
+    // for RENEW (16.28), and 9.6.3 leaves it to the server how long a client id whose
     // lease has lapsed survives -- so a late RENEW may equally be refused as a
     // stale id, refused as an expired lease, or simply succeed.  The model
     // retires a client id the moment a superseding SETCLIENTID replaces its
@@ -491,8 +491,10 @@ module nfs4 {
     def readyClients: Set[ClientId] =
         sdb.clients.keys().filter(c =>
             sdb.clients.get(c).confirmed and (MINOR == 0 or sessOf(c) != -1) and
-            // A lease-lost tombstone is not driven further by the generator
-            // (expiredClientRecoverTest pins what its old clientid answers).
+            // A lease-lost tombstone gets no new state from the generator.
+            // nsRenew still draws from every client, so the walk does RENEW
+            // tombstones, which keeps opRenew's lease-lost gate reachable;
+            // expiredClientRecoverTest pins what the old clientid answers.
             not(sdb.lostClients.contains(c)))
 
     // SEQUENCE prefix for a 4.1+ compound: slot 0, next slot seqid.
@@ -909,7 +911,7 @@ module nfs4 {
         },
     }
 
-    // RENEW (RFC 7530 16.30): explicit 4.0 lease renewal; 4.1+ renews
+    // RENEW (RFC 7530 16.28): explicit 4.0 lease renewal; 4.1+ renews
     // implicitly through SEQUENCE, so the op answers NFS4ERR_NOTSUPP there.
     // Both arms were modeled and neither was ever generated, which is why
     // chimera's whole renew path sat unexercised.  Drawing the *argument*
@@ -2310,6 +2312,9 @@ module nfs4 {
                  .union(sdb.delegs.keys().filter(s => sdb.delegs.get(s).client == c)
                      .map(s => sdb.delegs.get(s).file))
       all {
+        // 4.0 only: 4.1+ (CREATE_SESSION, DESTROY_CLIENTID) does not model
+        // a tombstone, so a direct call from a 4.1+ run is disabled.
+        MINOR == 0,
         fs' = held.fold(fs, (acc, f) => maybeReap(acc, sdb2, f)),
         sdb' = sdb2,
         caps' = caps,
@@ -2329,9 +2334,11 @@ module nfs4 {
     }
 
     // Witness: an owner lost its lease, re-registered, and now holds a
-    // confirmed open under its new clientid.  Explore with
-    // --step=stepLease --invariant=noExpiredRecovery to stop at the first
-    // trace that reaches it.
+    // confirmed open under its new clientid.  Explore under a 4.0 main
+    // (e.g. nfs4_run.qnt --main=nfs4V40) with --step=stepLease
+    // --invariant=noExpiredRecovery to stop at the first trace that reaches
+    // it; under a 4.1+ main stepLease reduces to stepBody and it is never
+    // reached.
     val expiredRecovered: bool =
         sdb.lostClients.exists(l =>
             sdb.clients.keys().exists(c =>

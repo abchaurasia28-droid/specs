@@ -159,10 +159,16 @@ module nfs4state {
         lo40: (ClientId, int) -> { seqid: int },
         // Lease loss (RFC 7530 9.6.3): clients whose lease was cancelled
         // and whose state the server released.  The record survives as a
-        // tombstone so its clientid answers NFS4ERR_EXPIRED, but it no
-        // longer represents the owner: SETCLIENTID must not hand it back.
+        // tombstone so OPEN and RENEW on its clientid answer
+        // NFS4ERR_EXPIRED (see opOpen / opRenew for the accepted
+        // alternatives), but it no longer represents the owner: SETCLIENTID
+        // must not hand it back.  Other ops (LOCKT, RELEASE_LOCKOWNER) do
+        // not consult it.
         lostClients: Set[ClientId],
-        // Stateids released by a lease loss: using one is NFS4ERR_EXPIRED.
+        // Stateids released by a lease loss.  Only CLOSE consults it
+        // (NFS4ERR_EXPIRED, or BAD_STATEID per RFC 7530 9.1.4.4); every
+        // other stateid op still answers BAD_STATEID through sidLive /
+        // checkSid.  Also keeps sdbFreedStayDead honest for these sids.
         expiredSids: Set[Sid]
     }
 
@@ -301,8 +307,9 @@ module nfs4state {
     // Lease loss: the lease lapsed and the server released the client's
     // state (lease sweep, or a conflicting OPEN reclaimed a courtesy
     // client).  Opens, locks, delegations, layouts and sessions go, as in
-    // purgeClient, but their stateids become EXPIRED rather than BAD, and
-    // the record stays as a tombstone in lostClients.  Per RFC 7530
+    // purgeClient, but their stateids go to expiredSids rather than
+    // freedSids (CLOSE answers EXPIRED for them; other ops still answer
+    // BAD_STATEID), and the record stays as a tombstone in lostClients.  Per RFC 7530
     // 9.6.3.2 the client recovers with SETCLIENTID + SETCLIENTID_CONFIRM
     // "in order to establish a new clientid": clientByOwner skips the
     // tombstone, so the next SETCLIENTID mints a fresh record even with
