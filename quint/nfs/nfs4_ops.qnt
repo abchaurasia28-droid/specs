@@ -1783,6 +1783,11 @@ module nfs4ops {
     // nsRenew), because the wire form is a resop the harness cannot decode.
     pure def opRenew(a: Acc, cid: ClientId): Acc =
         if (a.minor != 0) emit(a, SRenew({ st: E_OP_ILLEGAL, stAccept: Set(E_OP_ILLEGAL) }))
+        else if (a.sdb.lostClients.contains(cid))
+            // Lease cancelled and state released: RFC 7530 16.30.4 lists both
+            // NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID; never NFS4_OK.
+            emit(a, SRenew({ st: E_EXPIRED,
+                             stAccept: Set(E_EXPIRED, E_STALE_CLIENTID) }))
         else if (not(a.sdb.clients.keys().contains(cid)) or
                  not(a.sdb.clients.get(cid).confirmed))
             emit(a, SRenew({ st: E_STALE_CLIENTID,
@@ -2277,7 +2282,10 @@ module nfs4ops {
         val g = fhGate(a)
         // 4.0: the owner-seqid gate runs first and BAD_SEQID does not
         // consume a seqid (RFC 7530 9.1.7/9.1.9).
-        if (a.minor == 0 and
+        if (a.sdb.lostClients.contains(ar.client))
+            // Lease cancelled: the old clientid is expired (RFC 7530 9.6.3.2).
+            emit(a, SOpen(nores.with("st", E_EXPIRED)))
+        else if (a.minor == 0 and
             (not(a.sdb.clients.keys().contains(ar.client)) or
              not(a.sdb.clients.get(ar.client).confirmed)))
             emit(a, SOpen(nores.with("st", E_STALE_CLIENTID)))
@@ -2513,6 +2521,8 @@ module nfs4ops {
     pure def opClose(a: Acc, ar: { sid: Sid, argSeq: int, oseq: int }): Acc = {
         val g = fhGate(a)
         if (g != OK) emit(a, SClose({ st: g }))
+        else if (a.sdb.expiredSids.contains(ar.sid))
+            emit(a, SClose({ st: E_EXPIRED }))
         else if (not(sidLive(a.sdb, ar.sid, KOpen)))
             emit(a, SClose({ st: E_BAD_STATEID }))
         else {

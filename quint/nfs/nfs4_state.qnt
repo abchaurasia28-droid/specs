@@ -156,7 +156,14 @@ module nfs4state {
         // (client, owner-symbol) request sequence and confirmation.
         // Lock-owners get the same treatment once they hold lock state.
         oo40: (ClientId, int) -> { seqid: int, confirmed: bool },
-        lo40: (ClientId, int) -> { seqid: int }
+        lo40: (ClientId, int) -> { seqid: int },
+        // Lease loss (RFC 7530 9.6.3): clients whose lease was cancelled
+        // and whose state the server released.  The record survives as a
+        // tombstone so its clientid answers NFS4ERR_EXPIRED, but it no
+        // longer represents the owner: SETCLIENTID must not hand it back.
+        lostClients: Set[ClientId],
+        // Stateids released by a lease loss: using one is NFS4ERR_EXPIRED.
+        expiredSids: Set[Sid]
     }
 
     pure def sdbInit: StateDB = {
@@ -171,7 +178,9 @@ module nfs4state {
         nextSid: 0,
         freedSids: Set(),
         oo40: Map(),
-        lo40: Map()
+        lo40: Map(),
+        lostClients: Set(),
+        expiredSids: Set()
     }
 
     pure def smapDrop(m, k) = m.keys().exclude(Set(k)).mapBy(x => m.get(x))
@@ -185,7 +194,8 @@ module nfs4state {
     // record per owner exist at a time (RFC 7530 16.33.5).
     pure def clientByOwner(sdb: StateDB, ownerSym: int, wantConfirmed: bool): ClientId =
         sdb.clients.keys().fold(-1, (acc, c) =>
-            if (sdb.clients.get(c).ownerSym == ownerSym and
+            if (not(sdb.lostClients.contains(c)) and
+                sdb.clients.get(c).ownerSym == ownerSym and
                 sdb.clients.get(c).confirmed == wantConfirmed) c else acc)
 
     type SetClientIdRes = {
@@ -286,6 +296,28 @@ module nfs4state {
            .with("sessions", sdb.sessions.keys().exclude(deadSess)
                  .mapBy(s => sdb.sessions.get(s)))
            .with("freedSids", sdb.freedSids.union(gone))
+    }
+
+    // Lease loss: the lease lapsed and the server released the client's
+    // state (lease sweep, or a conflicting OPEN reclaimed a courtesy
+    // client).  Opens, locks, delegations, layouts and sessions go, as in
+    // purgeClient, but their stateids become EXPIRED rather than BAD, and
+    // the record stays as a tombstone in lostClients.  Per RFC 7530
+    // 9.6.3.2 the client recovers with SETCLIENTID + SETCLIENTID_CONFIRM
+    // "in order to establish a new clientid": clientByOwner skips the
+    // tombstone, so the next SETCLIENTID mints a fresh record even with
+    // the same verifier.
+    pure def applyLeaseLost(sdb: StateDB, cid: ClientId): StateDB = {
+        val p = purgeClient(sdb, cid)
+        val gone = p.freedSids.exclude(sdb.freedSids)
+        // The confirm verifier dies with the lease: a retransmitted
+        // SETCLIENTID_CONFIRM for the dead clientid must not report success
+        // (it answers STALE_CLIENTID, as chimera 6144c989 and knfsd do).
+        p.with("clients", p.clients.put(cid,
+              sdb.clients.get(cid).with("confirmTok", -1)))
+         .with("freedSids", sdb.freedSids)
+         .with("lostClients", sdb.lostClients.union(Set(cid)))
+         .with("expiredSids", sdb.expiredSids.union(gone))
     }
 
     // ------------------------------------------------------------------
@@ -939,12 +971,14 @@ module nfs4state {
                 val a = sdb.clients.get(c1)
                 val b = sdb.clients.get(c2)
                 c1 == c2 or a.ownerSym != b.ownerSym or
-                a.confirmed != b.confirmed
+                a.confirmed != b.confirmed or
+                // A lease-lost tombstone no longer represents its owner.
+                sdb.lostClients.contains(c1) or sdb.lostClients.contains(c2)
             }))
 
     // Freed sids never come back.
     pure def sdbFreedStayDead(sdb: StateDB): bool =
-        sdb.freedSids.intersect(
+        sdb.freedSids.union(sdb.expiredSids).intersect(
             sdb.opens.keys().union(sdb.locks.keys())
                 .union(sdb.delegs.keys()).union(sdb.layouts.keys())) == Set()
 
