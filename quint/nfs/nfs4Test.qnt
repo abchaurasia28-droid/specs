@@ -53,12 +53,14 @@ module nfs4Test42 {
         match lastOp {
             | LCompound(l) => l.status
             | LInit(x) => -1
+            | LLeaseLost(x) => -1
         }
 
     def lastResults: List[OpRes] =
         match lastOp {
             | LCompound(l) => l.results
             | LInit(x) => []
+            | LLeaseLost(x) => []
         }
 
     def resAt(i: int): OpRes = lastResults[i]
@@ -1223,12 +1225,14 @@ module nfs4Test40 {
         match lastOp {
             | LCompound(l) => l.status
             | LInit(x) => -1
+            | LLeaseLost(x) => -1
         }
 
     def lastResults: List[OpRes] =
         match lastOp {
             | LCompound(l) => l.results
             | LInit(x) => []
+            | LLeaseLost(x) => []
         }
 
     def resAt(i: int): OpRes = lastResults[i]
@@ -1275,6 +1279,65 @@ module nfs4Test40 {
             .then(runC([ RSetclientid({ ownerSym: 1, verfSym: 1, tok: 100 }) ]))
             .then(runC([ RSetclientidConfirm({ client: 0, tok: 100 }) ]))
             .expect(sdb.clients.get(0).confirmed)
+
+    // RFC 7530 9.6.3.2: after a lease is cancelled and the client's state
+    // released, the old stateids are EXPIRED; SETCLIENTID with the same
+    // owner AND the same verifier (client did not reboot) must establish
+    // a NEW clientid, and OPEN under it must succeed.
+    run expiredClientRecoverTest =
+        boot40
+            .then(runC([ RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 1,
+                                 claim: OCNull("f"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK)
+            .then(runC([ RPutfh(1), ROpenConfirm({ sid: 0, oseq: 2 }) ]))
+            .expect(lastStatus == OK)
+            .then(leaseLostOf(0))
+            .expect(sdb.opens.keys() == Set() and sdb.lostClients == Set(0))
+            // RENEW of the dead clientid is never OK.
+            .then(runC([ RRenew(0) ]))
+            .expect(lastStatus == E_EXPIRED)
+            // A retransmitted confirm of the dead clientid does not succeed.
+            .then(runC([ RSetclientidConfirm({ client: 0, tok: 100 }) ]))
+            .expect(lastStatus == E_STALE_CLIENTID)
+            // Old open stateid -> EXPIRED.
+            .then(runC([ RPutfh(1), RClose({ sid: 0, argSeq: 0, oseq: 3 }) ]))
+            .expect(lastStatus == E_EXPIRED)
+            // Old clientid -> EXPIRED.
+            .then(runC([ RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 4,
+                                 claim: OCNull("g"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }) ]))
+            .expect(lastStatus == E_EXPIRED)
+            // Re-register: same owner, same verifier -> a NEW clientid.
+            .then(runC([ RSetclientid({ ownerSym: 1, verfSym: 1, tok: 200 }) ]))
+            .expect(lastStatus == OK and sdb.clients.keys() == Set(0, 1))
+            .then(runC([ RSetclientidConfirm({ client: 1, tok: 200 }) ]))
+            .expect(lastStatus == OK and sdb.clients.get(1).confirmed)
+            // The recovered client can open again.
+            .then(runC([ RPutrootfh,
+                         ROpen({ client: 1, owner: 1, oseq: 1,
+                                 claim: OCNull("g"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }), RGetfh ]))
+            .expect(lastStatus == OK)
+            .then(runC([ RPutfh(2), ROpenConfirm({ sid: 1, oseq: 2 }) ]))
+            .expect(lastStatus == OK)
+            .expect(expiredRecovered)
+            // After recovery the old clientid is still dead, and the new
+            // client's confirm did not purge the tombstone.
+            .expect(sdb.clients.keys() == Set(0, 1))
+            .then(runC([ RPutrootfh,
+                         ROpen({ client: 0, owner: 1, oseq: 5,
+                                 claim: OCNull("h"),
+                                 how: HGuarded({ mode: 420 }),
+                                 access: 3, deny: 0 }) ]))
+            .expect(lastStatus == E_EXPIRED)
+            .then(runC([ RRenew(0) ]))
+            .expect(lastStatus == E_EXPIRED)
 
     // 4.0 open-owner discipline: first open demands OPEN_CONFIRM; the
     // stateid is unusable until confirmed; wrong confirm seqid kills the
@@ -1434,4 +1497,9 @@ module nfs4Test40 {
 
     run randomWalk40Test =
         init.then(120.reps(_ => all { inv, step }))
+
+    // The same walk with lease loss enabled, so the lost-lease state
+    // (tombstones, expired stateids, the orphan reap) runs under inv.
+    run randomLeaseWalk40Test =
+        init.then(120.reps(_ => all { inv, stepLease }))
 }

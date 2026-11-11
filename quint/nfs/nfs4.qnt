@@ -103,8 +103,8 @@ module nfs4 {
     // corpus replayed against every backend can say.
     const T_XATTR_CHANGE: bool
 
-    // RFC 7530 16.30.4 lists BOTH NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID
-    // for RENEW, and 9.6.3 leaves it to the server how long a client id whose
+    // RFC 7530 13.2 lists BOTH NFS4ERR_EXPIRED and NFS4ERR_STALE_CLIENTID
+    // for RENEW (16.28), and 9.6.3 leaves it to the server how long a client id whose
     // lease has lapsed survives -- so a late RENEW may equally be refused as a
     // stale id, refused as an expired lease, or simply succeed.  The model
     // retires a client id the moment a superseding SETCLIENTID replaces its
@@ -223,6 +223,10 @@ module nfs4 {
         // harness materializes -- "" means use the default.
         | LCompound({ tag: int, tagName: str, ops: List[OpReq], status: int,
                       results: List[OpRes] })
+        // Environment event, not a compound: the server cancels this
+        // client's lease and releases its state.  The harness must make the
+        // real server do the same before the next compound.
+        | LLeaseLost({ client: int })
 
     var fs: Fs
     var sdb: StateDB
@@ -486,7 +490,12 @@ module nfs4 {
     // clientid, 4.1+ additionally a session.
     def readyClients: Set[ClientId] =
         sdb.clients.keys().filter(c =>
-            sdb.clients.get(c).confirmed and (MINOR == 0 or sessOf(c) != -1))
+            sdb.clients.get(c).confirmed and (MINOR == 0 or sessOf(c) != -1) and
+            // A lease-lost tombstone gets no new state from the generator.
+            // nsRenew still draws from every client, so the walk does RENEW
+            // tombstones, which keeps opRenew's lease-lost gate reachable;
+            // expiredClientRecoverTest pins what the old clientid answers.
+            not(sdb.lostClients.contains(c)))
 
     // SEQUENCE prefix for a 4.1+ compound: slot 0, next slot seqid.
     // (List(..) rather than a [..] literal: a bracket after a val binding
@@ -902,7 +911,7 @@ module nfs4 {
         },
     }
 
-    // RENEW (RFC 7530 16.30): explicit 4.0 lease renewal; 4.1+ renews
+    // RENEW (RFC 7530 16.28): explicit 4.0 lease renewal; 4.1+ renews
     // implicitly through SEQUENCE, so the op answers NFS4ERR_NOTSUPP there.
     // Both arms were modeled and neither was ever generated, which is why
     // chimera's whole renew path sat unexercised.  Drawing the *argument*
@@ -2287,6 +2296,61 @@ module nfs4 {
     // Step distributions
     // ------------------------------------------------------------------
 
+    // A confirmed 4.0 client that holds an open loses its lease.
+    def leaseLostEligible: Set[ClientId] =
+        sdb.clients.keys().filter(c =>
+            sdb.clients.get(c).confirmed and
+            not(sdb.lostClients.contains(c)) and
+            sdb.opens.keys().exists(s => sdb.opens.get(s).client == c))
+
+    action leaseLostOf(c: ClientId): bool = {
+      val sdb2 = applyLeaseLost(sdb, c)
+      // Files whose last pin was this client's state: reap orphans, as
+      // CLOSE / DELEGRETURN do.
+      val held = sdb.opens.keys().filter(s => sdb.opens.get(s).client == c)
+                     .map(s => sdb.opens.get(s).file)
+                 .union(sdb.delegs.keys().filter(s => sdb.delegs.get(s).client == c)
+                     .map(s => sdb.delegs.get(s).file))
+      all {
+        // 4.0 only: 4.1+ (CREATE_SESSION, DESTROY_CLIENTID) does not model
+        // a tombstone, so a direct call from a 4.1+ run is disabled.
+        MINOR == 0,
+        fs' = held.fold(fs, (acc, f) => maybeReap(acc, sdb2, f)),
+        sdb' = sdb2,
+        caps' = caps,
+        tag' = tag,
+        prev' = { valid: false, tag: tag, ops: [] },
+        lastOp' = LLeaseLost({ client: c }),
+        devHits' = Set(),
+        advisedOpens' = advisedOpens,
+      }
+    }
+
+    action leaseLost = all {
+        MINOR == 0,
+        leaseLostEligible.size() > 0,
+        nondet c = oneOf(leaseLostEligible)
+        leaseLostOf(c),
+    }
+
+    // Witness: an owner lost its lease, re-registered, and now holds a
+    // confirmed open under its new clientid.  Explore under a 4.0 main
+    // (e.g. nfs4_run.qnt --main=nfs4V40) with --step=stepLease
+    // --invariant=noExpiredRecovery to stop at the first trace that reaches
+    // it; under a 4.1+ main stepLease reduces to stepBody and it is never
+    // reached.
+    val expiredRecovered: bool =
+        sdb.lostClients.exists(l =>
+            sdb.clients.keys().exists(c =>
+                not(sdb.lostClients.contains(c)) and
+                sdb.clients.get(c).confirmed and
+                sdb.clients.get(c).ownerSym == sdb.clients.get(l).ownerSym and
+                // Same verifier: the client did not reboot (the bug's path).
+                sdb.clients.get(c).verfSym == sdb.clients.get(l).verfSym and
+                sdb.opens.keys().exists(s => sdb.opens.get(s).client == c and
+                                             not(sdb.opens.get(s).needConfirm))))
+    val noExpiredRecovery: bool = not(expiredRecovered)
+
     action stepBody = any {
         setupSetclientid,
         setupSetclientidConfirm,
@@ -2524,6 +2588,11 @@ module nfs4 {
     // window, reclaimPending is always false, and each of these is exactly
     // its body.
     action step          = if (reclaimPending) reclaimFirst else stepBody
+    // Opt-in flavor: the random walk plus lease loss.  Kept out of `step`
+    // because a lease-loss event needs harness support (the server must be
+    // made to drop the lease), which not every harness has.
+    action stepLease     = if (reclaimPending) reclaimFirst
+                           else any { leaseLost, stepBody }
     action stepState     = if (reclaimPending) reclaimFirst else stepStateBody
     action stepNamespace = if (reclaimPending) reclaimFirst else stepNamespaceBody
     action stepDeleg     = if (reclaimPending) reclaimFirst else stepDelegBody
@@ -2573,6 +2642,28 @@ module nfs4 {
                 else runC([RCreateSession({client: 0, csaSeq: 1, backChan: true})]))
             .then(if (MINOR == 0) runC([RPutfh(ROOT), RGetattr])
                 else runC(withSess(0, [RReclaimComplete])))
+
+    // RFC 7530 9.6.3.2: a 4.0 client whose lease was cancelled and whose
+    // state was released re-registers with SETCLIENTID +
+    // SETCLIENTID_CONFIRM "in order to establish a new clientid".  A client
+    // that did not reboot presents the SAME verifier, so this is the
+    // callback-update shape on the wire, yet the server must not hand back
+    // the dead clientid: the new OPEN and OPEN_CONFIRM must succeed.
+    run expiredClientRecoveryRegression =
+        coverageBootRun
+            .then(runC([RPutfh(ROOT),
+                ROpen({client: 0, owner: 1, oseq: 1, claim: OCNull("a"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}), RGetfh]))
+            .then(runC([RPutfh(1), ROpenConfirm({sid: 0, oseq: 2})]))
+            .then(leaseLostOf(0))
+            .then(runC([RPutfh(1), RClose({sid: 0, argSeq: 0, oseq: 3})]))
+            .then(runC([RSetclientid({ownerSym: 1, verfSym: 1, tok: 50})]))
+            .then(runC([RSetclientidConfirm({client: 1, tok: 50})]))
+            .then(runC([RPutfh(ROOT),
+                ROpen({client: 1, owner: 1, oseq: 1, claim: OCNull("b"),
+                       how: HGuarded({mode: 420}), access: 3, deny: 0}), RGetfh]))
+            .then(runC([RPutfh(2), ROpenConfirm({sid: 1, oseq: 2})]))
+            .expect(expiredRecovered)
 
     run typeCoverageRegression =
         coverageBootRun
@@ -2640,6 +2731,7 @@ module nfs4 {
             .expect(match lastOp {
                         | LCompound(l) => l.status == OK
                         | LInit(x) => false
+                        | LLeaseLost(x) => false
                     })
             .then(runC(withSess(0, [RPutfh(ROOT),
                 ROpen({client: 0, owner: 2, oseq: 1, claim: OCNull("a"),
@@ -2647,6 +2739,7 @@ module nfs4 {
             .expect(match lastOp {
                         | LCompound(l) => l.status == OK
                         | LInit(x) => false
+                        | LLeaseLost(x) => false
                     })
             .then(if (MINOR == 0) runC([RPutfh(ROOT), RGetattr])
                   else runC(withSess(0, [RPutfh(ROOT),
@@ -2656,6 +2749,7 @@ module nfs4 {
             .expect(match lastOp {
                         | LCompound(l) => l.status == OK
                         | LInit(x) => false
+                        | LLeaseLost(x) => false
                     })
             .then(if (MINOR == 0) runC([RPutfh(ROOT), RGetattr])
                   else runC(withSess(0, [RPutfh(ROOT),
@@ -2665,6 +2759,7 @@ module nfs4 {
             .expect(match lastOp {
                         | LCompound(l) => l.status == OK
                         | LInit(x) => false
+                        | LLeaseLost(x) => false
                     })
 
     // A COMPOUND carrying the 256-byte NLONG tag.  Whether a server caps the
@@ -2700,6 +2795,7 @@ module nfs4 {
                         | LCompound(l) =>
                             l.status == (if (replaces) E_BAD_STATEID else OK)
                         | LInit(x) => false
+                        | LLeaseLost(x) => false
                     })
     }
 
@@ -2724,6 +2820,7 @@ module nfs4 {
             .expect(match lastOp {
                         | LCompound(l) => l.status == E_NOTDIR
                         | LInit(x) => false
+                        | LLeaseLost(x) => false
                     })
             .expect(fsLive(fs, 1) ==
                     not(DEVS.contains("K4-open-replaces-unconfirmed-owner")))
@@ -2759,6 +2856,7 @@ module nfs4 {
                         | LCompound(l) =>
                             l.status == (if (reuses) OK else E_BAD_SEQID)
                         | LInit(x) => false
+                        | LLeaseLost(x) => false
                     })
             .then(runC([RPutfh(1),
                 RLock({wr: false, lo: 4, hi: 5, newOwner: true, openSid: 0,
@@ -2767,6 +2865,7 @@ module nfs4 {
                         | LCompound(l) =>
                             l.status == (if (reuses) E_DENIED else E_BAD_SEQID)
                         | LInit(x) => false
+                        | LLeaseLost(x) => false
                     })
             .then(runC([RPutfh(1),
                 RLock({wr: false, lo: 0, hi: 1, newOwner: false, openSid: -1,
@@ -2775,6 +2874,7 @@ module nfs4 {
                         | LCompound(l) =>
                             l.status == (if (reuses) OK else E_BAD_SEQID)
                         | LInit(x) => false
+                        | LLeaseLost(x) => false
                     })
     }
 
