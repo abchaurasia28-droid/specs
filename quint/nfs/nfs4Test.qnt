@@ -1242,6 +1242,10 @@ module nfs4Test42 {
                                   srcOff: 3, dstOff: 0, cnt: 0 }) ]))
             .expect(lastStatus == E_INVAL)
 
+    // CI needs a local alias for the imported concrete-stateid/content run;
+    // keep it in 4.2 because CLONE is OP_ILLEGAL in earlier minor versions.
+    run cloneEofBoundaryTest = cloneEofBoundaryRegression
+
     // --- xattrs -------------------------------------------------------
 
     run xattrTest =
