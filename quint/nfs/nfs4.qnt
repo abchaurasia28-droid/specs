@@ -628,11 +628,26 @@ module nfs4 {
     // inode it describes.  Such a layout is unusable for generation: reaching
     // it means a PUTFH of a removed ino, and the model deliberately leaves the
     // position of that STALE open -- PUTFH may report it or defer to the first
-    // use (R-CORE-102) -- so the generator must not present one.
+    // use (R-CORE-102) -- so the generator must not present one.  A layout on
+    // a file that is still open but has lost its last link is held back too:
+    // RFC 8881 12.5.5 lets a server recall it at the REMOVE, at the last close
+    // or never (layoutUncertain), and those choices leave different layout
+    // state behind.  Nothing is held back because some server gets it wrong.
     def usableLayouts: Set[Sid] =
         sdb.layouts.keys().filter(s =>
             clientUsable(sdb.layouts.get(s).client) and
-            fsLive(fs, sdb.layouts.get(s).file))
+            not(layoutUncertain(fs, sdb, s)))
+
+    // Opens a LAYOUTGET may be issued through: not one on a file with no
+    // links left, for the reason usableLayouts gives (see opLayoutget).
+    def layoutgetOpens: Set[Sid] =
+        usableOpens.filter(s => fsGet(fs, sdb.opens.get(s).file).nlink > 0)
+
+    // Clients DESTROY_CLIENTID may be issued for: not one that is busy only
+    // through uncertain layouts, where a server that kept them and one that
+    // dropped them answer differently (destroyClientidUncertain).
+    def destroyableClients: Set[ClientId] =
+        sdb.clients.keys().filter(c => not(destroyClientidUncertain(fs, sdb, c)))
 
     def openSel(s: Sid): SidSel =
         SelRef({ sid: s, kind: KOpen, argSeq: 0 })
@@ -835,12 +850,13 @@ module nfs4 {
     }
 
     // DESTROY_CLIENTID: CLIENTID_BUSY while sessions/state exist, OK on a
-    // bare client record.
+    // bare client record.  A client busy only through uncertain layouts is
+    // left out (destroyableClients).
     action destroyClientid = all {
         MINOR >= 1,
-        sdb.clients.keys().size() > 0,
+        destroyableClients.size() > 0,
         {
-            nondet c = oneOf(sdb.clients.keys())
+            nondet c = oneOf(destroyableClients)
             runC([ RDestroyClientid(c) ])
         },
     }
@@ -1894,9 +1910,9 @@ module nfs4 {
     action pnfsLayoutget = all {
         MINOR >= 1,
         caps.pnfs,
-        usableOpens.size() > 0,
+        layoutgetOpens.size() > 0,
         {
-            nondet s = oneOf(usableOpens)
+            nondet s = oneOf(layoutgetOpens)
             val o = sdb.opens.get(s)
             nondet rw = oneOf(Set(false, true))
             nondet lo = oneOf(0.to(MAX_BLOCKS - 1))
