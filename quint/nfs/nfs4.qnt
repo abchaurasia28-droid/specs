@@ -1726,9 +1726,10 @@ module nfs4 {
             // one when both exist, rather than leaving the mix to whichever
             // delegations happen to be live.  A write/size/write_same/
             // allocate/deallocate through a read delegation is NFS4ERR_OPENMODE
-            // (which==1,2,5,6,7), and a chmod (which==3) is OK through either
-            // kind but must be seen through both so coverage can tell them
-            // apart -- without steering, a 2-hit -openmode or a missing
+            // (which==1,2,5,6,7).  READ, READ_PLUS and SEEK (which==0,4,8) are
+            // read arms and are OK through either delegation type, and a chmod
+            // (which==3) is OK through either kind but must be seen through
+            // both so coverage can tell them apart -- without steering, a 2-hit -openmode or a missing
             // -readdeleg bucket is one generator shift away from the gate.
             // The read preference is the minority (one draw in three) so the
             // OK path -- the common case, and the one a write delegation
