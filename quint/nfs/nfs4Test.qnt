@@ -1033,7 +1033,7 @@ module nfs4Test42 {
             .expect(asLayoutget(resAt(2)).stAccept ==
                     Set(OK, E_RECALLCONFLICT, E_LAYOUTUNAVAILABLE,
                         E_BAD_STATEID))
-            // The open stateid: every answer but BAD_STATEID.
+            // The open stateid: every status.
             .then(runC([ seq0(9), RPutfh(1),
                          RLayoutget({ rw: false, lo: 0, hi: 1,
                                       sel: SelRef({ sid: 0, kind: KOpen,
@@ -1099,6 +1099,72 @@ module nfs4Test42 {
                     Set(E_CLIENTID_BUSY, OK))
             .expect(sdb.clients.keys().contains(0) and
                     sdb.layouts.keys() == Set(2))
+
+    // The state right after the REMOVE of a file that is still open and has
+    // a layout: open 0 on the unlinked file, layout 2 uncertain.
+    run layoutRemovedSetup =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .then(runC([ seq0(4), RPutrootfh, RRemove("f") ]))
+            .expect(lastStatus == OK and sdb.layouts.keys() == Set(2))
+            .expect(fsLive(fs, 1) and fsGet(fs, 1).nlink == 0)
+            .expect(layoutUncertain(fs, sdb, 2) and usableOpens.contains(0))
+
+    // The layout actions draw from the filtered sets, so none is generated
+    // for an uncertain layout.  Each run fails when its action has no
+    // enabled step, which is what points the action back at an unfiltered
+    // set would break.
+    run layoutgetNotGeneratedOnUnlinkedTest =
+        layoutRemovedSetup.then(pnfsLayoutget).fail()
+
+    run layoutreturnNotGeneratedOnUncertainTest =
+        layoutRemovedSetup.then(pnfsLayoutreturn).fail()
+
+    run layoutcommitNotGeneratedOnUncertainTest =
+        layoutRemovedSetup.then(pnfsLayoutcommit).fail()
+
+    // Only an uncertain layout is left, so a server may already have dropped
+    // its device ID (RFC 8881 12.2.10, 18.40.3 NFS4ERR_NOENT).
+    run deviceinfoNotGeneratedOnUncertainTest =
+        layoutRemovedSetup.then(pnfsDeviceinfo).fail()
+
+    run destroyClientidNotGeneratedOnUncertainTest =
+        openCreateRun
+            .then(runC([ seq0(2), RPutfh(1),
+                         RDelegreturn({ sid: 1, kind: KDeleg, argSeq: 0 }) ]))
+            .then(runC([ seq0(3), RPutfh(1),
+                         RLayoutget({ rw: true, lo: 0, hi: 2,
+                                      sel: SelRef({ sid: 0, kind: KOpen,
+                                                    argSeq: 0 }) }) ]))
+            .then(runC([ seq0(4), RPutrootfh, RRemove("f") ]))
+            .then(runC([ seq0(5), RPutfh(1),
+                         RClose({ sid: 0, argSeq: 0, oseq: 0 }) ]))
+            .then(runC([ RDestroySession(0) ]))
+            .expect(lastStatus == OK and sdb.layouts.keys() == Set(2))
+            .expect(destroyClientidUncertain(fs, sdb, 0))
+            .then(destroyClientid).fail()
+
+    // A LINK back to a file with no links left would make its layout certain
+    // again, so with pNFS on such a source is never generated and the layout
+    // stays out of generation.  (The op itself is still accepted when a
+    // trace carries it; only the generator keeps away.)
+    run layoutUnlinkedNoLinkBackTest =
+        layoutRemovedSetup
+            .expect(not(linkSources.contains(1)))
+            .expect(linkSources.contains(0))
+            .expect(not(usableLayouts.contains(2)) and
+                    not(layoutgetOpens.contains(0)))
+            // The generated LINK never takes the unlinked file as its source,
+            // whichever source and names it draws.
+            .then(nsLink)
+            .expect(fsGet(fs, 1).nlink == 0 and layoutUncertain(fs, sdb, 2))
+            .expect(not(usableLayouts.contains(2)) and
+                    not(layoutgetOpens.contains(0)))
 
     // RENAME over the last link of a regular file changes no layout state
     // either: the replaced file, still open, keeps its layout, which is now

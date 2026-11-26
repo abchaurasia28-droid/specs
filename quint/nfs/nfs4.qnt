@@ -643,6 +643,15 @@ module nfs4 {
     def layoutgetOpens: Set[Sid] =
         usableOpens.filter(s => fsGet(fs, sdb.opens.get(s).file).nlink > 0)
 
+    // Inodes a LINK may take as its source.  Where pNFS is on, not one with no
+    // links left: a LINK back would make its uncertain layouts certain again
+    // (layoutUncertain reads the link count), and the generator must not
+    // present an op whose answer depends on one.  Without pNFS no layout
+    // exists, and every live inode stays a candidate.
+    def linkSources: Set[Ino] =
+        if (caps.pnfs) liveInos.filter(i => fs.inodes.get(i).nlink > 0)
+        else liveInos
+
     // Clients DESTROY_CLIENTID may be issued for: not one that is busy only
     // through uncertain layouts, where a server that kept them and one that
     // dropped them answer differently (destroyClientidUncertain).
@@ -1231,10 +1240,11 @@ module nfs4 {
 
     action nsLink = all {
         genReady,
+        linkSources.size() > 0,
         {
             nondet wm = oneOf(0.to(3))
             nondet wt = oneOf(FTYPES)
-            nondet o = oneOf(liveInos)
+            nondet o = oneOf(linkSources)
             nondet d = oneOf(wide(dirs, wm, wt))
             nondet n = oneOf(NAMES)
             if (delegOther(o, anyReady))
@@ -1976,7 +1986,7 @@ module nfs4 {
     // is worth generating, so the gate applies only where pNFS is on.
     action pnfsDeviceinfo = all {
         MINOR >= 1,
-        not(caps.pnfs) or sdb.layouts.keys().size() > 0,
+        not(caps.pnfs) or usableLayouts.size() > 0,
         readyClients.size() > 0,
         {
             nondet c = oneOf(readyClients)

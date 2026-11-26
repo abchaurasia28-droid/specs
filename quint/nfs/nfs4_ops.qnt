@@ -851,8 +851,11 @@ module nfs4ops {
     // leaves layout state untouched at REMOVE, RENAME and reap, and derives
     // the uncertainty from file state alone rather than tracking it: the
     // generator presents nothing whose outcome depends on such a layout
-    // (usableLayouts), and where one is reached anyway the reply accepts
-    // every answer those choices allow.
+    // (usableLayouts, layoutgetOpens and destroyableClients in nfs4.qnt).
+    // Two replies widen their status for a trace that reaches one anyway:
+    // LAYOUTGET (opLayoutget) and DESTROY_CLIENTID (opDestroyClientid).
+    // LAYOUTRETURN and LAYOUTCOMMIT do not, and a LAYOUTGET grant is still
+    // compared stateid for stateid.
     pure def layoutUncertain(fs: Fs, sdb: StateDB, s: Sid): bool = {
         val f = sdb.layouts.get(s).file
         not(fsLive(fs, f)) or fsGet(fs, f).nlink == 0
@@ -1666,11 +1669,12 @@ module nfs4ops {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
                                       else fs1
-                            // A size change recalls every layout on the file
-                            // (see revokeLayoutsOn).  A layout is not a pin
-                            // (see pinnedInos), so revoking them never reaps
-                            // the file: an orphan that gets here is still
-                            // pinned by an open or a delegation.
+                            // A size change recalls every layout on the file (see
+                            // revokeLayoutsOn).  A layout is not a pin (see
+                            // pinnedInos), so the revoke is never what reaps
+                            // the file: maybeReap sees the same pins before
+                            // and after, and acts only on an orphan that had
+                            // already lost its last pin.
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
@@ -1686,11 +1690,12 @@ module nfs4ops {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
                                       else fs1
-                            // A size change recalls every layout on the file
-                            // (see revokeLayoutsOn).  A layout is not a pin
-                            // (see pinnedInos), so revoking them never reaps
-                            // the file: an orphan that gets here is still
-                            // pinned by an open or a delegation.
+                            // A size change recalls every layout on the file (see
+                            // revokeLayoutsOn).  A layout is not a pin (see
+                            // pinnedInos), so the revoke is never what reaps
+                            // the file: maybeReap sees the same pins before
+                            // and after, and acts only on an orphan that had
+                            // already lost its last pin.
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
@@ -1703,11 +1708,12 @@ module nfs4ops {
                             val fs1 = fsResize(a.fs, a.cfh, ar.sizeBlocks)
                             val fs2 = if (ar.mode >= 0) fsChmod(fs1, a.cfh, ar.mode)
                                       else fs1
-                            // A size change recalls every layout on the file
-                            // (see revokeLayoutsOn).  A layout is not a pin
-                            // (see pinnedInos), so revoking them never reaps
-                            // the file: an orphan that gets here is still
-                            // pinned by an open or a delegation.
+                            // A size change recalls every layout on the file (see
+                            // revokeLayoutsOn).  A layout is not a pin (see
+                            // pinnedInos), so the revoke is never what reaps
+                            // the file: maybeReap sees the same pins before
+                            // and after, and acts only on an orphan that had
+                            // already lost its last pin.
                             val sdbR = revokeLayoutsOn(a.sdb, a.cfh)
                             emit(a.with("fs", maybeReap(fs2, sdbR, a.cfh))
                                   .with("sdb", sdbR),
